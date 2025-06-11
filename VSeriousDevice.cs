@@ -1,14 +1,20 @@
-﻿using System;
+﻿using Microsoft.Win32.SafeHandles;
+using System;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
+using System.Text;
 
 namespace vSeriousSDK
 {
     public class VSeriousDevice : IDisposable
     {
+        private static readonly string devicePath = "\\\\.\\vSerious";
+
         private SafeFileHandle deviceHandle;
+        private SafeFileHandle comHandle;
+        private string comPort;
+
         private bool disposed = false;
 
         private const uint FILE_DEVICE_SERIAL_PORT = 0x0000001b;
@@ -21,6 +27,8 @@ namespace vSeriousSDK
 
         private static readonly uint IOCTL_VSERIOUS_SET_ACTIVE = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS);
         private static readonly uint IOCTL_VSERIOUS_GET_ACTIVE = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS);
+        private static readonly uint IOCTL_VSERIOUS_SET_COM_NAME = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS);
+        private static readonly uint IOCTL_VSERIOUS_GET_COM_NAME = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
         private static extern SafeFileHandle CreateFile(
@@ -36,9 +44,9 @@ namespace vSeriousSDK
         private static extern bool DeviceIoControl(
             SafeFileHandle hDevice,
             uint dwIoControlCode,
-            ref bool inBuffer,
+            IntPtr inBuffer,
             int nInBufferSize,
-            out bool outBuffer,
+            IntPtr outBuffer,
             int nOutBufferSize,
             out int bytesReturned,
             IntPtr overlapped);
@@ -59,7 +67,7 @@ namespace vSeriousSDK
             out int lpNumberOfBytesWritten,
             IntPtr lpOverlapped);
 
-        public VSeriousDevice(string devicePath)
+        public VSeriousDevice()
         {
             deviceHandle = CreateFile(devicePath,
                 FileAccess.ReadWrite,
@@ -75,54 +83,179 @@ namespace vSeriousSDK
             }
         }
 
+        public void SetCOMPort(string comPort)
+        {
+            if (comHandle != null && !comHandle.IsInvalid)
+            {
+                throw new ApplicationException("Invalid State");
+            }
+
+            if (string.IsNullOrWhiteSpace(comPort))
+            {
+                throw new ArgumentNullException(nameof(comPort));
+            }
+
+            if (!comPort.StartsWith(@"\\.\"))
+            {
+                comPort = @"\\.\" + comPort;
+            }
+
+            this.comPort = comPort;
+            byte[] stringBytes = Encoding.Unicode.GetBytes(comPort);
+            int inSize = stringBytes.Length;
+            IntPtr inPtr = Marshal.AllocHGlobal(inSize);
+
+            try
+            {
+                Marshal.Copy(stringBytes, 0, inPtr, inSize);
+
+                if (!DeviceIoControl(
+                    deviceHandle,
+                    IOCTL_VSERIOUS_SET_COM_NAME,
+                    inPtr,
+                    inSize,
+                    IntPtr.Zero,
+                    0,
+                    out _,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to set COM port name.");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(inPtr);
+            }
+        }
+
+        public string GetCOMPort()
+        {
+            if (string.IsNullOrWhiteSpace(this.comPort))
+            {
+                throw new ApplicationException(nameof(comPort));
+            }
+
+            const int bufferSize = 64; 
+            IntPtr outPtr = Marshal.AllocHGlobal(bufferSize);
+
+            try
+            {
+                if (!DeviceIoControl(
+                    deviceHandle,
+                    IOCTL_VSERIOUS_GET_COM_NAME,
+                    IntPtr.Zero,
+                    0,
+                    outPtr,
+                    bufferSize,
+                    out int bytesReturned,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to get COM port name.");
+                }
+
+                return Marshal.PtrToStringUni(outPtr, bytesReturned / 2); 
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(outPtr);
+            }
+        }
+
         public void SetActive(bool active)
         {
-            bool output;
-            int bytesReturned;
-
-            bool success = DeviceIoControl(
-                deviceHandle,
-                IOCTL_VSERIOUS_SET_ACTIVE,
-                ref active,
-                Marshal.SizeOf(typeof(bool)),
-                out output,
-                Marshal.SizeOf(typeof(bool)),
-                out bytesReturned,
-                IntPtr.Zero);
-
-            if (!success)
+            if (!active && comHandle != null)
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to set device active state.");
+                comHandle.Close();
+                comHandle.Dispose();
+                comHandle = null;
+            }
+
+            IntPtr inPtr = Marshal.AllocHGlobal(1);
+            IntPtr outPtr = Marshal.AllocHGlobal(1);
+
+            try
+            {
+                Marshal.WriteByte(inPtr, active ? (byte)1 : (byte)0);
+
+                if (!DeviceIoControl(
+                    deviceHandle,
+                    IOCTL_VSERIOUS_SET_ACTIVE,
+                    inPtr,
+                    1,
+                    outPtr,
+                    1,
+                    out _,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to set device active state.");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(inPtr);
+                Marshal.FreeHGlobal(outPtr);
+            }
+
+            if (active)
+            {
+                if (string.IsNullOrWhiteSpace(comPort))
+                    throw new InvalidOperationException("COM port must be set before activating.");
+
+                comHandle = CreateFile(this.comPort,
+                    FileAccess.ReadWrite,
+                    FileShare.ReadWrite,
+                    IntPtr.Zero,
+                    FileMode.Open,
+                    0,
+                    IntPtr.Zero);
+
+                if (comHandle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to open COM handle.");
+                }
             }
         }
 
         public bool GetActive()
         {
-            bool input = false;
-            bool output;
-            int bytesReturned;
+            IntPtr inPtr = Marshal.AllocHGlobal(1);
+            IntPtr outPtr = Marshal.AllocHGlobal(1);
 
-            bool success = DeviceIoControl(
-                deviceHandle,
-                IOCTL_VSERIOUS_GET_ACTIVE,
-                ref input,
-                0,
-                out output,
-                Marshal.SizeOf(typeof(bool)),
-                out bytesReturned,
-                IntPtr.Zero);
-
-            if (!success)
+            try
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to get device active state.");
-            }
+                Marshal.WriteByte(inPtr, 0);
 
-            return output;
+                if (!DeviceIoControl(
+                    deviceHandle,
+                    IOCTL_VSERIOUS_GET_ACTIVE,
+                    inPtr,
+                    1,
+                    outPtr,
+                    1,
+                    out _,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to get device active state.");
+                }
+
+                return Marshal.ReadByte(outPtr) != 0;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(inPtr);
+                Marshal.FreeHGlobal(outPtr);
+            }
         }
 
         public void Write(byte[] data)
         {
-            if (!WriteFile(deviceHandle, data, data.Length, out int bytesWritten, IntPtr.Zero))
+            if (data == null || data.Length == 0)
+                throw new ArgumentNullException(nameof(data));
+
+            if (comHandle == null || comHandle.IsInvalid)
+                throw new InvalidOperationException("COM port is not active.");
+
+            if (!WriteFile(comHandle, data, data.Length, out int bytesWritten, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "WriteFile failed.");
             }
@@ -130,9 +263,15 @@ namespace vSeriousSDK
 
         public byte[] Read(int length)
         {
+            if (length <= 0)
+                throw new ArgumentOutOfRangeException(nameof(length), "Length must be positive.");
+
+            if (comHandle == null || comHandle.IsInvalid)
+                throw new InvalidOperationException("COM port is not active.");
+
             byte[] buffer = new byte[length];
 
-            if (!ReadFile(deviceHandle, buffer, length, out int bytesRead, IntPtr.Zero))
+            if (!ReadFile(comHandle, buffer, length, out int bytesRead, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "ReadFile failed.");
             }
@@ -149,9 +288,19 @@ namespace vSeriousSDK
                 {
                     deviceHandle.Dispose();
                 }
+                if (comHandle != null && !comHandle.IsInvalid)
+                {
+                    comHandle.Dispose();
+                }
                 disposed = true;
+                GC.SuppressFinalize(this);
             }
-            GC.SuppressFinalize(this);
+        }
+
+        ~VSeriousDevice()
+        {
+            Dispose();
         }
     }
+
 }
