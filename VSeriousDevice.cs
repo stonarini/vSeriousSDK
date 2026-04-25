@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace vSeriousSDK
 {
@@ -66,6 +67,19 @@ namespace vSeriousSDK
             int nNumberOfBytesToWrite,
             out int lpNumberOfBytesWritten,
             IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetCommTimeouts(SafeFileHandle hFile, ref COMMTIMEOUTS lpCommTimeouts);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct COMMTIMEOUTS
+        {
+            public uint ReadIntervalTimeout;
+            public uint ReadTotalTimeoutMultiplier;
+            public uint ReadTotalTimeoutConstant;
+            public uint WriteTotalTimeoutMultiplier;
+            public uint WriteTotalTimeoutConstant;
+        }
 
         public VSeriousDevice()
         {
@@ -203,18 +217,45 @@ namespace vSeriousSDK
                 if (string.IsNullOrWhiteSpace(comPort))
                     throw new InvalidOperationException("COM port must be set before activating.");
 
-                comHandle = CreateFile(this.comPort,
-                    FileAccess.ReadWrite,
-                    FileShare.ReadWrite,
-                    IntPtr.Zero,
-                    FileMode.Open,
-                    0,
-                    IntPtr.Zero);
-
-                if (comHandle.IsInvalid)
+                // PnP enumeration of the new PDO is asynchronous — the symbolic
+                // link may not exist yet by the time SetActive returns. Retry
+                // briefly before giving up.
+                int lastError = 0;
+                for (int attempt = 0; attempt < 20; attempt++)
                 {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to open COM handle.");
+                    comHandle = CreateFile(this.comPort,
+                        FileAccess.ReadWrite,
+                        FileShare.ReadWrite,
+                        IntPtr.Zero,
+                        FileMode.Open,
+                        0,
+                        IntPtr.Zero);
+
+                    if (!comHandle.IsInvalid)
+                        break;
+
+                    lastError = Marshal.GetLastWin32Error();
+                    comHandle.Dispose();
+                    comHandle = null;
+                    Thread.Sleep(100);
                 }
+
+                if (comHandle == null || comHandle.IsInvalid)
+                {
+                    throw new Win32Exception(lastError, "Failed to open COM handle after activation.");
+                }
+
+                // Make Read block until data is available; otherwise the default
+                // timeouts can cause Read to return zero bytes immediately.
+                COMMTIMEOUTS timeouts = new COMMTIMEOUTS
+                {
+                    ReadIntervalTimeout = 0xFFFFFFFF,
+                    ReadTotalTimeoutMultiplier = 0,
+                    ReadTotalTimeoutConstant = 0,
+                    WriteTotalTimeoutMultiplier = 0,
+                    WriteTotalTimeoutConstant = 1000
+                };
+                SetCommTimeouts(comHandle, ref timeouts);
             }
         }
 
