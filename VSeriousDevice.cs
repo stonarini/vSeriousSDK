@@ -95,13 +95,15 @@ namespace vSeriousSDK
                 throw new ArgumentNullException(nameof(comPort));
             }
 
-            if (!comPort.StartsWith(@"\\.\"))
+            string bareName = comPort;
+            if (bareName.StartsWith(@"\\.\") || bareName.StartsWith(@"\\?\"))
             {
-                comPort = @"\\.\" + comPort;
+                bareName = bareName.Substring(4);
             }
 
-            this.comPort = comPort;
-            byte[] stringBytes = Encoding.Unicode.GetBytes(comPort);
+            this.comPort = @"\\.\" + bareName;
+
+            byte[] stringBytes = Encoding.Unicode.GetBytes(bareName);
             int inSize = stringBytes.Length;
             IntPtr inPtr = Marshal.AllocHGlobal(inSize);
 
