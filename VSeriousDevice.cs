@@ -186,33 +186,11 @@ namespace vSeriousSDK
                 comHandle = null;
             }
 
-            IntPtr inPtr = Marshal.AllocHGlobal(1);
-            IntPtr outPtr = Marshal.AllocHGlobal(1);
+            SetActiveIoctl(active);
+
+            if (!active) return;
 
             try
-            {
-                Marshal.WriteByte(inPtr, active ? (byte)1 : (byte)0);
-
-                if (!DeviceIoControl(
-                    deviceHandle,
-                    IOCTL_VSERIOUS_SET_ACTIVE,
-                    inPtr,
-                    1,
-                    outPtr,
-                    1,
-                    out _,
-                    IntPtr.Zero))
-                {
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to set device active state.");
-                }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(inPtr);
-                Marshal.FreeHGlobal(outPtr);
-            }
-
-            if (active)
             {
                 if (string.IsNullOrWhiteSpace(comPort))
                     throw new InvalidOperationException("COM port must be set before activating.");
@@ -256,6 +234,43 @@ namespace vSeriousSDK
                     WriteTotalTimeoutConstant = 1000
                 };
                 SetCommTimeouts(comHandle, ref timeouts);
+            }
+            catch
+            {
+                // Driver flipped Active=TRUE and reported the PDO, but we never
+                // took ownership of the COM handle. Roll back so the controller
+                // doesn't stay stuck active (which blocks SetCOMPort next time).
+                try { SetActiveIoctl(false); } catch { /* best-effort */ }
+                throw;
+            }
+        }
+
+        private void SetActiveIoctl(bool active)
+        {
+            IntPtr inPtr = Marshal.AllocHGlobal(1);
+            IntPtr outPtr = Marshal.AllocHGlobal(1);
+
+            try
+            {
+                Marshal.WriteByte(inPtr, active ? (byte)1 : (byte)0);
+
+                if (!DeviceIoControl(
+                    deviceHandle,
+                    IOCTL_VSERIOUS_SET_ACTIVE,
+                    inPtr,
+                    1,
+                    outPtr,
+                    1,
+                    out _,
+                    IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to set device active state.");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(inPtr);
+                Marshal.FreeHGlobal(outPtr);
             }
         }
 
