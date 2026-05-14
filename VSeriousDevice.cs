@@ -30,6 +30,11 @@ namespace vSeriousSDK
         private static readonly uint IOCTL_VSERIOUS_GET_ACTIVE = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x801, METHOD_BUFFERED, FILE_READ_ACCESS);
         private static readonly uint IOCTL_VSERIOUS_SET_COM_NAME = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS);
         private static readonly uint IOCTL_VSERIOUS_GET_COM_NAME = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS);
+        // Hardware-side data path. Cristina uses ReadFile/WriteFile on
+        // \\.\COMx; we use these on \\.\vSerious so the per-direction
+        // ring buffers stay decoupled (no echo, no race).
+        private static readonly uint IOCTL_VSERIOUS_READ = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS);
+        private static readonly uint IOCTL_VSERIOUS_WRITE = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
         private static extern SafeFileHandle CreateFile(
@@ -310,12 +315,24 @@ namespace vSeriousSDK
             if (data == null || data.Length == 0)
                 throw new ArgumentNullException(nameof(data));
 
-            if (comHandle == null || comHandle.IsInvalid)
-                throw new InvalidOperationException("COM port is not active.");
+            if (deviceHandle == null || deviceHandle.IsInvalid)
+                throw new InvalidOperationException("Device handle is not open.");
 
-            if (!WriteFile(comHandle, data, data.Length, out int bytesWritten, IntPtr.Zero))
+            IntPtr inBuf = Marshal.AllocHGlobal(data.Length);
+            try
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "WriteFile failed.");
+                Marshal.Copy(data, 0, inBuf, data.Length);
+                if (!DeviceIoControl(deviceHandle, IOCTL_VSERIOUS_WRITE,
+                        inBuf, data.Length, IntPtr.Zero, 0,
+                        out int _, IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "IOCTL_VSERIOUS_WRITE failed.");
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(inBuf);
             }
         }
 
@@ -324,18 +341,27 @@ namespace vSeriousSDK
             if (length <= 0)
                 throw new ArgumentOutOfRangeException(nameof(length), "Length must be positive.");
 
-            if (comHandle == null || comHandle.IsInvalid)
-                throw new InvalidOperationException("COM port is not active.");
+            if (deviceHandle == null || deviceHandle.IsInvalid)
+                throw new InvalidOperationException("Device handle is not open.");
 
-            byte[] buffer = new byte[length];
-
-            if (!ReadFile(comHandle, buffer, length, out int bytesRead, IntPtr.Zero))
+            IntPtr outBuf = Marshal.AllocHGlobal(length);
+            try
             {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "ReadFile failed.");
+                if (!DeviceIoControl(deviceHandle, IOCTL_VSERIOUS_READ,
+                        IntPtr.Zero, 0, outBuf, length,
+                        out int bytesRead, IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "IOCTL_VSERIOUS_READ failed.");
+                }
+                byte[] buffer = new byte[bytesRead];
+                if (bytesRead > 0) Marshal.Copy(outBuf, buffer, 0, bytesRead);
+                return buffer;
             }
-
-            Array.Resize(ref buffer, bytesRead);
-            return buffer;
+            finally
+            {
+                Marshal.FreeHGlobal(outBuf);
+            }
         }
 
         public void Dispose()
