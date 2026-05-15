@@ -12,7 +12,13 @@ namespace vSeriousSDK
     {
         private static readonly string devicePath = "\\\\.\\vSerious";
 
-        private SafeFileHandle deviceHandle;
+        // Two handles to the controller device. The Windows I/O manager
+        // serializes IOCTLs on the same synchronous handle — so a parked
+        // IOCTL_VSERIOUS_READ (waiting for Cristina to write) blocks every
+        // other call (including the heartbeat's IOCTL_VSERIOUS_WRITE).
+        // Splitting Read/Write across two handles lets them run concurrently.
+        private SafeFileHandle deviceHandle;       // SetActive, SetCOMPort, Write
+        private SafeFileHandle deviceReadHandle;   // Read only
         private SafeFileHandle comHandle;
         private string comPort;
 
@@ -88,7 +94,13 @@ namespace vSeriousSDK
 
         public VSeriousDevice()
         {
-            deviceHandle = CreateFile(devicePath,
+            deviceHandle = OpenControllerHandle();
+            deviceReadHandle = OpenControllerHandle();
+        }
+
+        private static SafeFileHandle OpenControllerHandle()
+        {
+            var handle = CreateFile(devicePath,
                 FileAccess.ReadWrite,
                 FileShare.ReadWrite,
                 IntPtr.Zero,
@@ -96,10 +108,11 @@ namespace vSeriousSDK
                 0,
                 IntPtr.Zero);
 
-            if (deviceHandle.IsInvalid)
+            if (handle.IsInvalid)
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed to open device handle.");
             }
+            return handle;
         }
 
         public void SetCOMPort(string comPort)
@@ -184,16 +197,35 @@ namespace vSeriousSDK
 
         public void SetActive(bool active)
         {
-            if (!active && comHandle != null)
+            if (!active)
             {
-                comHandle.Close();
-                comHandle.Dispose();
-                comHandle = null;
+                // Cancel any in-flight Read by recycling the read handle —
+                // closing the handle forces the parked IOCTL_VSERIOUS_READ to
+                // complete with STATUS_CANCELLED, freeing the read loop. Then
+                // SetActiveIoctl tells the driver to flip the active flag.
+                if (deviceReadHandle != null && !deviceReadHandle.IsInvalid)
+                {
+                    deviceReadHandle.Close();
+                    deviceReadHandle.Dispose();
+                    deviceReadHandle = null;
+                }
+                if (comHandle != null)
+                {
+                    comHandle.Close();
+                    comHandle.Dispose();
+                    comHandle = null;
+                }
             }
 
             SetActiveIoctl(active);
 
             if (!active) return;
+
+            // Re-open the read handle for the new session.
+            if (deviceReadHandle == null || deviceReadHandle.IsInvalid)
+            {
+                deviceReadHandle = OpenControllerHandle();
+            }
 
             try
             {
@@ -341,13 +373,15 @@ namespace vSeriousSDK
             if (length <= 0)
                 throw new ArgumentOutOfRangeException(nameof(length), "Length must be positive.");
 
-            if (deviceHandle == null || deviceHandle.IsInvalid)
-                throw new InvalidOperationException("Device handle is not open.");
+            if (deviceReadHandle == null || deviceReadHandle.IsInvalid)
+                throw new InvalidOperationException("Device read handle is not open.");
 
             IntPtr outBuf = Marshal.AllocHGlobal(length);
             try
             {
-                if (!DeviceIoControl(deviceHandle, IOCTL_VSERIOUS_READ,
+                // Uses the dedicated read handle so the IOCTL can park in the
+                // driver's SdkReadQueue without blocking the write handle.
+                if (!DeviceIoControl(deviceReadHandle, IOCTL_VSERIOUS_READ,
                         IntPtr.Zero, 0, outBuf, length,
                         out int bytesRead, IntPtr.Zero))
                 {
@@ -371,6 +405,10 @@ namespace vSeriousSDK
                 if (deviceHandle != null && !deviceHandle.IsInvalid)
                 {
                     deviceHandle.Dispose();
+                }
+                if (deviceReadHandle != null && !deviceReadHandle.IsInvalid)
+                {
+                    deviceReadHandle.Dispose();
                 }
                 if (comHandle != null && !comHandle.IsInvalid)
                 {
