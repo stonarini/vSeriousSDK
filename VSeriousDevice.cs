@@ -227,59 +227,24 @@ namespace vSeriousSDK
                 deviceReadHandle = OpenControllerHandle();
             }
 
-            try
-            {
-                if (string.IsNullOrWhiteSpace(comPort))
-                    throw new InvalidOperationException("COM port must be set before activating.");
-
-                // PnP enumeration of the new PDO is asynchronous — the symbolic
-                // link may not exist yet by the time SetActive returns. Retry
-                // briefly before giving up.
-                int lastError = 0;
-                for (int attempt = 0; attempt < 20; attempt++)
-                {
-                    comHandle = CreateFile(this.comPort,
-                        FileAccess.ReadWrite,
-                        FileShare.ReadWrite,
-                        IntPtr.Zero,
-                        FileMode.Open,
-                        0,
-                        IntPtr.Zero);
-
-                    if (!comHandle.IsInvalid)
-                        break;
-
-                    lastError = Marshal.GetLastWin32Error();
-                    comHandle.Dispose();
-                    comHandle = null;
-                    Thread.Sleep(100);
-                }
-
-                if (comHandle == null || comHandle.IsInvalid)
-                {
-                    throw new Win32Exception(lastError, "Failed to open COM handle after activation.");
-                }
-
-                // Make Read block until data is available; otherwise the default
-                // timeouts can cause Read to return zero bytes immediately.
-                COMMTIMEOUTS timeouts = new COMMTIMEOUTS
-                {
-                    ReadIntervalTimeout = 0xFFFFFFFF,
-                    ReadTotalTimeoutMultiplier = 0,
-                    ReadTotalTimeoutConstant = 0,
-                    WriteTotalTimeoutMultiplier = 0,
-                    WriteTotalTimeoutConstant = 1000
-                };
-                SetCommTimeouts(comHandle, ref timeouts);
-            }
-            catch
-            {
-                // Driver flipped Active=TRUE and reported the PDO, but we never
-                // took ownership of the COM handle. Roll back so the controller
-                // doesn't stay stuck active (which blocks SetCOMPort next time).
-                try { SetActiveIoctl(false); } catch { /* best-effort */ }
-                throw;
-            }
+            // The SDK doesn't actually use comHandle for I/O — all data
+            // moves through IOCTL_VSERIOUS_READ / IOCTL_VSERIOUS_WRITE on
+            // the controller handle. Originally we opened comHandle here
+            // for a side-effect (setting CommTimeouts on the COM port so
+            // its OWN reads block), but those settings apply to whoever
+            // owns the handle and don't affect Cristina's reads.
+            //
+            // Opening the COM port here is also fragile on Win 7 after a
+            // reboot: PnP may not have finished classifying the freshly-
+            // enumerated PDO (Code 31, "Windows cannot load the drivers
+            // required for this device"), so CreateFile returns "device
+            // not ready" and rolls back the whole SetActive.
+            //
+            // Cristina opens the COM port itself later via its WMI scan;
+            // by then PnP has settled. Skip the SDK-side open.
+            comHandle = null;
+            if (string.IsNullOrWhiteSpace(comPort))
+                throw new InvalidOperationException("COM port must be set before activating.");
         }
 
         private void SetActiveIoctl(bool active)
